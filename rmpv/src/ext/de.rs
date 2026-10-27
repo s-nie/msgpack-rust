@@ -353,26 +353,7 @@ impl<'de> Deserializer<'de> for Value {
                 Err(v) => visitor.visit_byte_buf(v.0),
             },
             Self::Binary(v) => visitor.visit_byte_buf(v),
-            Self::Array(v) => {
-                let len = v.len();
-                let mut de = SeqDeserializer::new(v.into_iter());
-                let seq = visitor.visit_seq(&mut de)?;
-                if de.iter.len() == 0 {
-                    Ok(seq)
-                } else {
-                    Err(de::Error::invalid_length(len, &"fewer elements in array"))
-                }
-            },
-            Self::Map(v) => {
-                let len = v.len();
-                let mut de = MapDeserializer::new(v.into_iter());
-                let map = visitor.visit_map(&mut de)?;
-                if de.iter.len() == 0 {
-                    Ok(map)
-                } else {
-                    Err(de::Error::invalid_length(len, &"fewer elements in map"))
-                }
-            },
+            v @ (Self::Array(_) | Self::Map(_)) => v.seq_inner(visitor),
             Self::Ext(tag, data) => {
                 let de = ExtDeserializer::new_owned(tag, data);
                 visitor.visit_newtype_struct(de)
@@ -538,26 +519,7 @@ impl<'de> Deserializer<'de> for ValueRef<'de> {
                 Err(v) => visitor.visit_borrowed_bytes(v.0),
             },
             ValueRef::Binary(v) => visitor.visit_borrowed_bytes(v),
-            ValueRef::Array(v) => {
-                let len = v.len();
-                let mut de = SeqDeserializer::new(v.into_iter());
-                let seq = visitor.visit_seq(&mut de)?;
-                if de.iter.len() == 0 {
-                    Ok(seq)
-                } else {
-                    Err(de::Error::invalid_length(len, &"fewer elements in array"))
-                }
-            },
-            ValueRef::Map(v) => {
-                let len = v.len();
-                let mut de = MapDeserializer::new(v.into_iter());
-                let map = visitor.visit_map(&mut de)?;
-                if de.iter.len() == 0 {
-                    Ok(map)
-                } else {
-                    Err(de::Error::invalid_length(len, &"fewer elements in map"))
-                }
-            },
+            v @ (ValueRef::Array(_) | ValueRef::Map(_)) => v.seq_inner(visitor),
             ValueRef::Ext(tag, data) => {
                 let de = ExtDeserializer::new_ref(tag, data);
                 visitor.visit_newtype_struct(de)
@@ -602,8 +564,6 @@ impl<'de> Deserializer<'de> for ValueRef<'de> {
     {
         ValueBase::deserialize_unit_struct(self, visitor)
     }
-
-    // Narrow hints only call the relevant `visit_*` methods, which keeps per-visitor code small.
 
     #[inline]
     fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
@@ -669,26 +629,7 @@ impl<'de> Deserializer<'de> for &'de ValueRef<'de> {
                 Err(v) => visitor.visit_borrowed_bytes(v.0),
             },
             ValueRef::Binary(v) => visitor.visit_borrowed_bytes(v),
-            ValueRef::Array(ref v) => {
-                let len = v.len();
-                let mut de = SeqDeserializer::new(v.iter());
-                let seq = visitor.visit_seq(&mut de)?;
-                if de.iter.len() == 0 {
-                    Ok(seq)
-                } else {
-                    Err(de::Error::invalid_length(len, &"fewer elements in array"))
-                }
-            },
-            ValueRef::Map(ref v) => {
-                let len = v.len();
-                let mut de = MapRefDeserializer::new(v.iter());
-                let map = visitor.visit_map(&mut de)?;
-                if de.iter.len() == 0 {
-                    Ok(map)
-                } else {
-                    Err(de::Error::invalid_length(len, &"fewer elements in map"))
-                }
-            },
+            ValueRef::Array(_) | ValueRef::Map(_) => self.seq_inner_ref(visitor),
             ValueRef::Ext(tag, data) => {
                 let de = ExtDeserializer::new_ref(tag, data);
                 visitor.visit_newtype_struct(de)
@@ -764,8 +705,6 @@ impl<'de> Deserializer<'de> for &'de ValueRef<'de> {
             other => Err(de::Error::invalid_type(other.unexpected(), &"empty array")),
         }
     }
-
-    // Narrow hints only call the relevant `visit_*` methods, which keeps per-visitor code small.
 
     #[inline]
     fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {

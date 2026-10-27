@@ -169,6 +169,13 @@ impl<W: Write> Serializer<W, DefaultConfig> {
             _back_compat_config: PhantomData,
         }
     }
+
+    /// Like `new().with_struct_map()`, but without another monomorphisation for `StructMapConfig`.
+    fn new_named(wr: W) -> Self {
+        let mut se = Self::new(wr);
+        se.config = RuntimeConfig::new(StructMapConfig::new(se.config));
+        se
+    }
 }
 
 impl<'a, W: Write + 'a, C> Serializer<W, C> {
@@ -1221,10 +1228,7 @@ where
     W: Write + ?Sized,
     T: Serialize + ?Sized,
 {
-    let mut se = Serializer::new(wr);
-    // Avoids another monomorphisation of `StructMapConfig`
-    se.config = RuntimeConfig::new(StructMapConfig::new(se.config));
-    val.serialize(&mut se)
+    val.serialize(&mut Serializer::new_named(wr))
 }
 
 /// Serialize the given data structure as a MessagePack byte vector.
@@ -1252,8 +1256,7 @@ pub fn to_vec_named<T>(val: &T) -> Result<Vec<u8>, Error>
 where
     T: Serialize + ?Sized,
 {
-    let mut se = Serializer::new(FallibleWriter(Vec::new()));
-    se.config = RuntimeConfig::new(StructMapConfig::new(se.config));
+    let mut se = Serializer::new_named(FallibleWriter(Vec::new()));
     val.serialize(&mut se)?;
     Ok(se.wr.0)
 }

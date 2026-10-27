@@ -477,7 +477,6 @@ fn read_u32<R: Read>(rd: &mut R) -> Result<u32, Error> {
     Ok(u32::from_be_bytes(buf))
 }
 
-#[derive(Clone, Copy)]
 enum AnyNumber {
     U8(u8),
     U16(u16),
@@ -666,8 +665,8 @@ fn read_header<'de, 'a, R: ReadSlice<'de>>(rd: &'a mut R, marker: Marker) -> Res
         Marker::Null => Header::Nil,
         Marker::True => Header::Bool(true),
         Marker::False => Header::Bool(false),
-        Marker::FixPos(n) => Header::Num(AnyNumber::U8(n)),
-        Marker::FixNeg(n) => Header::Num(AnyNumber::I8(n)),
+        Marker::FixPos(_) |
+        Marker::FixNeg(_) |
         Marker::U8 |
         Marker::U16 |
         Marker::U32 |
