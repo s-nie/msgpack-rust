@@ -9,8 +9,6 @@ use std::marker::PhantomData;
 use std::num::TryFromIntError;
 use std::str::{self, Utf8Error};
 
-use byteorder::{self, ReadBytesExt};
-
 use serde;
 use serde::de::value::SeqDeserializer;
 use serde::de::{self, Deserialize, DeserializeOwned, DeserializeSeed, Unexpected, Visitor};
@@ -106,12 +104,11 @@ impl Display for Error {
             Self::InvalidDataRead(ref err) => write!(fmt, "IO error while reading data: {err}"),
             Self::TypeMismatch(ref actual_marker) => {
                 write!(fmt, "wrong msgpack marker {actual_marker:?}")
-            }
+            },
             Self::OutOfRange => fmt.write_str("numeric cast found out of range"),
-            Self::LengthMismatch(expected_length) => write!(
-                fmt,
-                "array had incorrect length, expected {expected_length}"
-            ),
+            Self::LengthMismatch(expected_length) => {
+                write!(fmt, "array had incorrect length, expected {expected_length}")
+            },
             Self::Uncategorized(ref msg) => write!(fmt, "uncategorized error: {msg}"),
             Self::Syntax(ref msg) => fmt.write_str(msg),
             Self::Utf8Error(ref err) => write!(fmt, "string found to be invalid utf8: {err}"),
@@ -387,7 +384,7 @@ fn read_str_data<'de, 'r, R>(rd: &'r mut R, marker: Marker) -> Result<StrData<'d
                     Ok(StrData::BorrowedStrError(err, buf))
                 }
             }
-        }
+        },
         Reference::Copied(buf) => {
             match str::from_utf8(buf) {
                 Ok(s) => Ok(StrData::Str(s)),
@@ -395,7 +392,7 @@ fn read_str_data<'de, 'r, R>(rd: &'r mut R, marker: Marker) -> Result<StrData<'d
                     Ok(StrData::StrError(err, buf))
                 }
             }
-        }
+        },
     }
 }
 
@@ -464,24 +461,21 @@ fn read_bin_content<'a, 'de, R: ReadSlice<'de>>(rd: &'a mut R, len: u32) -> Resu
 }
 
 fn read_u8<R: Read>(rd: &mut R) -> Result<u8, Error> {
-    match byteorder::ReadBytesExt::read_u8(rd) {
-        Ok(v) => Ok(v),
-        Err(e) => Err(Error::InvalidDataRead(e)),
-    }
+    let mut buf = [0; 1];
+    rd.read_exact(&mut buf).map_err(Error::InvalidDataRead)?;
+    Ok(buf[0])
 }
 
 fn read_u16<R: Read>(rd: &mut R) -> Result<u16, Error> {
-    match rd.read_u16::<byteorder::BigEndian>() {
-        Ok(v) => Ok(v),
-        Err(e) => Err(Error::InvalidDataRead(e)),
-    }
+    let mut buf = [0; 2];
+    rd.read_exact(&mut buf).map_err(Error::InvalidDataRead)?;
+    Ok(u16::from_be_bytes(buf))
 }
 
 fn read_u32<R: Read>(rd: &mut R) -> Result<u32, Error> {
-    match rd.read_u32::<byteorder::BigEndian>() {
-        Ok(v) => Ok(v),
-        Err(e) => Err(Error::InvalidDataRead(e)),
-    }
+    let mut buf = [0; 4];
+    rd.read_exact(&mut buf).map_err(Error::InvalidDataRead)?;
+    Ok(u32::from_be_bytes(buf))
 }
 
 enum AnyNumber {
@@ -599,7 +593,7 @@ impl<'de, 'a, R: ReadSlice<'de> + 'a, C: SerializerConfig> de::Deserializer<'de>
                 let tag = self.rd.read_data_i8()?;
                 self.state = ExtDeserializerState::ReadTag;
                 visitor.visit_i8(tag)
-            }
+            },
             ExtDeserializerState::ReadTag => {
                 let data = self.rd.read_slice(self.len as usize).map_err(Error::InvalidDataRead)?;
                 self.state = ExtDeserializerState::ReadBinary;
@@ -607,7 +601,7 @@ impl<'de, 'a, R: ReadSlice<'de> + 'a, C: SerializerConfig> de::Deserializer<'de>
                     Reference::Borrowed(bytes) => visitor.visit_borrowed_bytes(bytes),
                     Reference::Copied(bytes) => visitor.visit_bytes(bytes),
                 }
-            }
+            },
             ExtDeserializerState::ReadBinary => {
                 debug_assert!(false);
                 Err(Error::TypeMismatch(Marker::Reserved))
@@ -705,7 +699,7 @@ impl<'de, R: ReadSlice<'de>, C: SerializerConfig> Deserializer<R, C> {
                         excess => Err(Error::LengthMismatch(len - excess)),
                     }
                 })
-            }
+            },
             Marker::Bin8 | Marker::Bin16 | Marker::Bin32 => {
                 match tri!(read_bin_data(&mut self.rd, marker)) {
                     Reference::Borrowed(buf) if allow_bytes => visitor.visit_borrowed_bytes(buf),
@@ -714,7 +708,7 @@ impl<'de, R: ReadSlice<'de>, C: SerializerConfig> Deserializer<R, C> {
                         visitor.visit_seq(SeqDeserializer::new(buf.iter().copied()))
                     },
                 }
-            }
+            },
             Marker::FixExt1 |
             Marker::FixExt2 |
             Marker::FixExt4 |
@@ -725,7 +719,7 @@ impl<'de, R: ReadSlice<'de>, C: SerializerConfig> Deserializer<R, C> {
             Marker::Ext32 => {
                 let len = tri!(ext_len(&mut self.rd, marker));
                 depth_count!(self.depth, visitor.visit_newtype_struct(ExtDeserializer::new(self, len)))
-            }
+            },
             Marker::Reserved => Err(Error::TypeMismatch(Marker::Reserved)),
         }
     }
@@ -785,7 +779,7 @@ impl<'de, R: ReadSlice<'de>, C: SerializerConfig> serde::Deserializer<'de> for &
                 1 => {
                     self.marker = None;
                     visitor.visit_enum(VariantAccess::new(self))
-                }
+                },
                 n => Err(Error::LengthMismatch(n)),
             },
             // TODO: Check this is a string
@@ -818,7 +812,7 @@ impl<'de, R: ReadSlice<'de>, C: SerializerConfig> serde::Deserializer<'de> for &
             marker => {
                 self.marker = Some(marker);
                 self.deserialize_any(visitor)
-            }
+            },
         }
     }
 
@@ -1271,8 +1265,8 @@ where R: Read,
 ///
 /// #[derive(Debug, Deserialize, PartialEq)]
 /// struct Dog<'a> {
-///    name: &'a str,
-///    age: u8,
+///     name: &'a str,
+///     age: u8,
 /// }
 ///
 /// assert_eq!(Dog { name: "Bobby", age: 8 }, rmp_serde::from_slice(&buf).unwrap());

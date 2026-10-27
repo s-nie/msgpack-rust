@@ -1,6 +1,6 @@
 [package]
 name = "rmp"
-version = "0.8.14"
+version = "0.8.15"
 authors = ["Evgeny Safronov <division494@gmail.com>", "Kornel <kornel@geekhood.net>"]
 license = "MIT"
 description = "Pure Rust MessagePack serialization implementation"
@@ -9,24 +9,22 @@ documentation = "https://docs.rs/rmp"
 readme = "README.md"
 keywords = ["msgpack", "MessagePack"]
 categories = ["encoding"]
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
-byteorder = { version = "1.4.2", default-features = false }
-num-traits = { version = "0.2.14", default-features = false }
-# This is macro_only ;)
-paste = "1.0"
+num-traits = { version = "0.2.19", default-features = false }
 
 [features]
 default = ["std"]
-std = ["byteorder/std", "num-traits/std"]
+std = ["num-traits/std"]
 
 [[example]]
 name = "inspect"
 required-features = ["std"]
 
 [dev-dependencies]
-quickcheck = "1.0.2"
+quickcheck = "1.0.3"
 
 [package.metadata.release]
 tag-prefix = "{{crate_name}}/"
