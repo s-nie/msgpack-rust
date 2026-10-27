@@ -474,3 +474,83 @@ fn pass_from_ref() {
 
     assert_eq!(Dog { name: "Bobby", age: 8 }, rmp_serde::from_read_ref(&buf).unwrap());
 }
+
+#[test]
+fn pass_skip_unknown_fields() {
+    #[derive(Debug, PartialEq, Deserialize)]
+    struct Small {
+        a: u8,
+        c: u8,
+    }
+
+    // {"a": 1, "b": [{"x": [1, -1, 1.5]}, ext(5, [1, 2]), bin([255]), "s", nil], "c": 2}
+    let buf = [
+        0x83,
+        0xa1, b'a', 0x01,
+        0xa1, b'b', 0x95,
+            0x81, 0xa1, b'x', 0x93, 0x01, 0xff, 0xcb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0,
+            0xd5, 0x05, 0x01, 0x02,
+            0xc4, 0x01, 0xff,
+            0xa1, b's',
+            0xc0,
+        0xa1, b'c', 0x02,
+    ];
+    assert_eq!(Small { a: 1, c: 2 }, rmp_serde::from_slice(&buf[..]).unwrap());
+}
+
+#[test]
+fn pass_bin_as_seq() {
+    // bin([1, 200, 3])
+    let buf = [0xc4, 0x03, 0x01, 0xc8, 0x03];
+    assert_eq!([1u8, 200, 3], rmp_serde::from_slice::<[u8; 3]>(&buf[..]).unwrap());
+    assert_eq!(vec![1u16, 200, 3], rmp_serde::from_slice::<Vec<u16>>(&buf[..]).unwrap());
+    assert_eq!((1u8, 200u32, 3i64), rmp_serde::from_slice(&buf[..]).unwrap());
+    // Excess bytes have been read already and are ignored
+    assert_eq!([1u8, 200], rmp_serde::from_slice::<[u8; 2]>(&buf[..]).unwrap());
+    assert!(rmp_serde::from_slice::<[u8; 4]>(&buf[..]).is_err());
+
+    // Followed by another value, read through the same `Deserializer`
+    let buf = [0x92, 0xc4, 0x02, 0x01, 0x02, 0x07];
+    assert_eq!(([1u8, 2], 7u8), rmp_serde::from_slice(&buf[..]).unwrap());
+}
+
+#[test]
+fn pass_identifier_index() {
+    #[derive(Debug, PartialEq, Deserialize)]
+    struct Struct {
+        a: u8,
+        b: u8,
+    }
+
+    // {1: 2, 0: 1}
+    let buf = [0x82, 0x01, 0x02, 0x00, 0x01];
+    assert_eq!(Struct { a: 1, b: 2 }, rmp_serde::from_slice(&buf[..]).unwrap());
+
+    // {bin("b"): 2, "a": 1}
+    let buf = [0x82, 0xc4, 0x01, b'b', 0x02, 0xa1, b'a', 0x01];
+    assert_eq!(Struct { a: 1, b: 2 }, rmp_serde::from_slice(&buf[..]).unwrap());
+}
+
+#[test]
+fn fail_invalid_type_messages() {
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct Struct {
+        a: u8,
+    }
+
+    let err = rmp_serde::from_slice::<Struct>(&[0xa1, b'x']).unwrap_err();
+    assert_eq!(err.to_string(), r#"invalid type: string "x", expected struct Struct"#);
+
+    let err = rmp_serde::from_slice::<Vec<u8>>(&[0xc0]).unwrap_err();
+    assert_eq!(err.to_string(), "invalid type: unit value, expected a sequence");
+
+    let err = rmp_serde::from_slice::<String>(&[0x2a]).unwrap_err();
+    assert_eq!(err.to_string(), "invalid type: integer `42`, expected a string");
+
+    let err = rmp_serde::from_slice::<u8>(&[0xa1, b'x']).unwrap_err();
+    assert!(matches!(err, Error::TypeMismatch(rmp::Marker::FixStr(1))), "{err:?}");
+
+    // Field names must be valid UTF-8
+    assert!(rmp_serde::from_slice::<Struct>(&[0x81, 0xa1, 0xff, 0x01]).is_err());
+}

@@ -179,10 +179,8 @@ impl<'a, W: Write + 'a, C> Serializer<W, C> {
 }
 
 impl<'a, W: Write + 'a, C: SerializerConfig> Serializer<W, C> {
-    #[inline]
-    fn maybe_unknown_len_compound<F>(&'a mut self, len: Option<u32>, f: F) -> Result<MaybeUnknownLengthCompound<'a, W, C>, Error>
-    where F: Fn(&mut W, u32) -> Result<Marker, ValueWriteError>
-    {
+    // A fn pointer rather than a closure, so this isn't instantiated once per caller
+    fn maybe_unknown_len_compound(&'a mut self, len: Option<u32>, f: fn(&mut W, u32) -> Result<Marker, ValueWriteError>) -> Result<MaybeUnknownLengthCompound<'a, W, C>, Error> {
         Ok(MaybeUnknownLengthCompound {
             compound: match len {
                 Some(len) => {
@@ -423,9 +421,7 @@ impl<'a, W: Write + 'a, C: SerializerConfig> SerializeStruct for Compound<'a, W,
         key: &'static str,
         value: &T,
     ) -> Result<(), Self::Error> {
-        if self.se.config.is_named {
-            encode::write_str(self.se.get_mut(), key)?;
-        }
+        self.se.write_field_key(key)?;
         value.serialize(&mut *self.se)
     }
 
@@ -459,9 +455,7 @@ impl<'a, W: Write + 'a, C: SerializerConfig> SerializeStructVariant for Compound
         key: &'static str,
         value: &T,
     ) -> Result<(), Self::Error> {
-        if self.se.config.is_named {
-            encode::write_str(self.se.get_mut(), key)?;
-        }
+        self.se.write_field_key(key)?;
         value.serialize(&mut *self.se)
     }
 
@@ -475,7 +469,8 @@ impl<'a, W: Write + 'a, C: SerializerConfig> SerializeStructVariant for Compound
 /// and a counter for the number of elements that are encoded by the `Serializer`.
 #[derive(Debug)]
 struct UnknownLengthCompound {
-    se: Serializer<Vec<u8>, DefaultConfig>,
+    // Same type as `to_vec` uses, so element `Serialize` impls aren't instantiated twice
+    se: Serializer<FallibleWriter, DefaultConfig>,
     elem_count: u32,
 }
 
@@ -483,7 +478,7 @@ impl<W, C: SerializerConfig> From<&Serializer<W, C>> for UnknownLengthCompound {
     fn from(se: &Serializer<W, C>) -> Self {
         Self {
             se: Serializer {
-                wr: Vec::with_capacity(128),
+                wr: FallibleWriter(Vec::with_capacity(128)),
                 config: RuntimeConfig::new(se.config),
                 depth: se.depth,
                 _back_compat_config: PhantomData,
@@ -533,7 +528,7 @@ impl<'a, W: Write + 'a, C: SerializerConfig> SerializeSeq for MaybeUnknownLength
     fn end(self) -> Result<Self::Ok, Self::Error> {
         if let Some(compound) = self.compound {
             encode::write_array_len(&mut self.se.wr, compound.elem_count)?;
-            self.se.wr.write_all(&compound.se.into_inner())
+            self.se.wr.write_all(&compound.se.into_inner().0)
                 .map_err(ValueWriteError::InvalidDataWrite)?;
         }
         Ok(())
@@ -555,7 +550,7 @@ impl<'a, W: Write + 'a, C: SerializerConfig> SerializeMap for MaybeUnknownLength
     fn end(self) -> Result<Self::Ok, Self::Error> {
         if let Some(compound) = self.compound {
             encode::write_map_len(&mut self.se.wr, compound.elem_count / 2)?;
-            self.se.wr.write_all(&compound.se.into_inner())
+            self.se.wr.write_all(&compound.se.into_inner().0)
                 .map_err(ValueWriteError::InvalidDataWrite)?;
         }
         Ok(())
@@ -699,7 +694,7 @@ where
 
     #[inline]
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Error> {
-        self.maybe_unknown_len_compound(len.map(|len| len as u32), |wr, len| encode::write_array_len(wr, len))
+        self.maybe_unknown_len_compound(len.map(|len| len as u32), encode::write_array_len)
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Self::Error> {
@@ -735,7 +730,7 @@ where
 
     #[inline]
     fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Error> {
-        self.maybe_unknown_len_compound(len.map(|len| len as u32), |wr, len| encode::write_map_len(wr, len))
+        self.maybe_unknown_len_compound(len.map(|len| len as u32), encode::write_map_len)
     }
 
     fn serialize_struct(
@@ -767,32 +762,45 @@ where
             _ => None,
         };
 
-        const MAX_ITER_SIZE: usize = std::mem::size_of::<<&[u8] as IntoIterator>::IntoIter>();
-        const ITEM_PTR_SIZE: usize = std::mem::size_of::<&u8>();
-
-        // Estimate whether the input is `&[u8]` or similar (hacky, because Rust lacks proper specialization)
-        let might_be_a_bytes_iter = (std::mem::size_of::<I::Item>() == 1 || std::mem::size_of::<I::Item>() == ITEM_PTR_SIZE)
-            // Complex types like HashSet<u8> don't support reading bytes.
-            // The simplest iterator is ptr+len.
-            && std::mem::size_of::<I::IntoIter>() <= MAX_ITER_SIZE;
-
-        let mut iter = iter.peekable();
-        if might_be_a_bytes_iter && self.config.bytes != BytesMode::Normal {
+        // Estimate whether the input is `&[u8]` or similar (hacky, because Rust lacks proper specialization).
+        // Inline `const` lets the compiler skip instantiating the bytes path for other element types.
+        if const {
+            (size_of::<I::Item>() == 1 || size_of::<I::Item>() == size_of::<&u8>())
+                // Complex types like HashSet<u8> don't support reading bytes.
+                // The simplest iterator is ptr+len.
+                && size_of::<I::IntoIter>() <= size_of::<<&[u8] as IntoIterator>::IntoIter>()
+        } && self.config.bytes != BytesMode::Normal {
             if let Some(len) = len {
+                let mut iter = iter.peekable();
                 // The `OnlyBytes` serializer emits `Err` for everything except `u8`
                 if iter.peek().is_some_and(|item| item.serialize(OnlyBytes).is_ok()) {
                     return self.bytes_from_iter(iter, len);
                 }
+                return self.seq_from_iter(iter, Some(len));
             }
         }
 
-        let mut serializer = self.serialize_seq(len.map(|len| len as usize))?;
-        iter.try_for_each(|item| serializer.serialize_element(&item))?;
-        SerializeSeq::end(serializer)
+        self.seq_from_iter(iter, len)
     }
 }
 
 impl<W: Write, C: SerializerConfig> Serializer<W, C> {
+    /// Kept out of `serialize_field`, which is instantiated per field type.
+    fn write_field_key(&mut self, key: &'static str) -> Result<(), Error> {
+        if self.config.is_named {
+            encode::write_str(&mut self.wr, key)?;
+        }
+        Ok(())
+    }
+
+    fn seq_from_iter<I>(&mut self, iter: I, len: Option<u32>) -> Result<(), Error> where I: Iterator, I::Item: Serialize {
+        let mut serializer = self.maybe_unknown_len_compound(len, encode::write_array_len)?;
+        for item in iter {
+            serializer.serialize_element(&item)?;
+        }
+        SerializeSeq::end(serializer)
+    }
+
     fn bytes_from_iter<I>(&mut self, mut iter: I, len: u32) -> Result<(), <&mut Self as serde::Serializer>::Error> where I: Iterator, I::Item: Serialize {
         encode::write_bin_len(&mut self.wr, len)?;
         iter.try_for_each(|item| {
@@ -1228,9 +1236,9 @@ pub fn to_vec<T>(val: &T) -> Result<Vec<u8>, Error>
 where
     T: Serialize + ?Sized,
 {
-    let mut wr = FallibleWriter(Vec::new());
-    write(&mut wr, val)?;
-    Ok(wr.0)
+    let mut se = Serializer::new(FallibleWriter(Vec::new()));
+    val.serialize(&mut se)?;
+    Ok(se.wr.0)
 }
 
 /// Serializes data structure into byte vector as a map
@@ -1244,12 +1252,14 @@ pub fn to_vec_named<T>(val: &T) -> Result<Vec<u8>, Error>
 where
     T: Serialize + ?Sized,
 {
-    let mut wr = FallibleWriter(Vec::new());
-    write_named(&mut wr, val)?;
-    Ok(wr.0)
+    let mut se = Serializer::new(FallibleWriter(Vec::new()));
+    se.config = RuntimeConfig::new(StructMapConfig::new(se.config));
+    val.serialize(&mut se)?;
+    Ok(se.wr.0)
 }
 
 #[repr(transparent)]
+#[derive(Debug)]
 struct FallibleWriter(Vec<u8>);
 
 impl Write for FallibleWriter {

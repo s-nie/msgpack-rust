@@ -10,7 +10,6 @@ use std::num::TryFromIntError;
 use std::str::{self, Utf8Error};
 
 use serde;
-use serde::de::value::SeqDeserializer;
 use serde::de::{self, Deserialize, DeserializeOwned, DeserializeSeed, Unexpected, Visitor};
 use serde::forward_to_deserialize_any;
 
@@ -478,6 +477,7 @@ fn read_u32<R: Read>(rd: &mut R) -> Result<u32, Error> {
     Ok(u32::from_be_bytes(buf))
 }
 
+#[derive(Clone, Copy)]
 enum AnyNumber {
     U8(u8),
     U16(u16),
@@ -505,6 +505,8 @@ fn read_any_number<'de, R>(rd: &mut R, marker: Marker) -> Result<AnyNumber, Erro
         Marker::I64 => Ok(AnyNumber::I64(rd.read_data_i64()?)),
         Marker::F32 => Ok(AnyNumber::F32(rd.read_data_f32()?)),
         Marker::F64 => Ok(AnyNumber::F64(rd.read_data_f64()?)),
+        Marker::FixPos(n) => Ok(AnyNumber::U8(n)),
+        Marker::FixNeg(n) => Ok(AnyNumber::I8(n)),
         other_marker => Err(Error::TypeMismatch(other_marker)),
     }
 }
@@ -616,111 +618,237 @@ impl<'de, 'a, R: ReadSlice<'de> + 'a, C: SerializerConfig> de::Deserializer<'de>
     }
 }
 
+/// A value's marker and length/scalar payload, read without knowing the visitor.
+enum Header<'de, 'a> {
+    Nil,
+    Bool(bool),
+    Num(AnyNumber),
+    Str(StrData<'de, 'a>),
+    Array(u32),
+    Map(u32),
+    Bin(Reference<'de, 'a, [u8]>),
+    Ext(u32),
+}
+
+impl Header<'_, '_> {
+    /// Same error a visitor's default `visit_*` would produce, without instantiating it per visitor.
+    #[cold]
+    fn invalid_type(&self, exp: &dyn de::Expected) -> Error {
+        let unexp = match *self {
+            Header::Nil => Unexpected::Unit,
+            Header::Bool(b) => Unexpected::Bool(b),
+            Header::Num(AnyNumber::U8(n)) => Unexpected::Unsigned(n.into()),
+            Header::Num(AnyNumber::U16(n)) => Unexpected::Unsigned(n.into()),
+            Header::Num(AnyNumber::U32(n)) => Unexpected::Unsigned(n.into()),
+            Header::Num(AnyNumber::U64(n)) => Unexpected::Unsigned(n),
+            Header::Num(AnyNumber::I8(n)) => Unexpected::Signed(n.into()),
+            Header::Num(AnyNumber::I16(n)) => Unexpected::Signed(n.into()),
+            Header::Num(AnyNumber::I32(n)) => Unexpected::Signed(n.into()),
+            Header::Num(AnyNumber::I64(n)) => Unexpected::Signed(n),
+            Header::Num(AnyNumber::F32(n)) => Unexpected::Float(n.into()),
+            Header::Num(AnyNumber::F64(n)) => Unexpected::Float(n),
+            Header::Str(StrData::Str(s)) => Unexpected::Str(s),
+            Header::Str(StrData::BorrowedStr(s)) => Unexpected::Str(s),
+            Header::Str(StrData::StrError(err, _) | StrData::BorrowedStrError(err, _)) => return Error::Utf8Error(err),
+            Header::Array(_) => Unexpected::Seq,
+            Header::Map(_) => Unexpected::Map,
+            Header::Bin(Reference::Borrowed(b)) => Unexpected::Bytes(b),
+            Header::Bin(Reference::Copied(b)) => Unexpected::Bytes(b),
+            Header::Ext(_) => Unexpected::NewtypeStruct,
+        };
+        de::Error::invalid_type(unexp, exp)
+    }
+}
+
 #[inline(never)]
-fn any_num<'de, R: ReadSlice<'de>, V: Visitor<'de>>(rd: &mut R, visitor: V, marker: Marker) -> Result<V::Value, Error> {
-    match marker {
-        Marker::Null => visitor.visit_unit(),
-        Marker::True |
-        Marker::False => visitor.visit_bool(marker == Marker::True),
-        Marker::FixPos(val) => visitor.visit_u8(val),
-        Marker::FixNeg(val) => visitor.visit_i8(val),
-        Marker::U8  |
+fn read_header<'de, 'a, R: ReadSlice<'de>>(rd: &'a mut R, marker: Marker) -> Result<Header<'de, 'a>, Error> {
+    Ok(match marker {
+        Marker::Null => Header::Nil,
+        Marker::True => Header::Bool(true),
+        Marker::False => Header::Bool(false),
+        Marker::FixPos(n) => Header::Num(AnyNumber::U8(n)),
+        Marker::FixNeg(n) => Header::Num(AnyNumber::I8(n)),
+        Marker::U8 |
         Marker::U16 |
         Marker::U32 |
         Marker::U64 |
-        Marker::I8  |
+        Marker::I8 |
         Marker::I16 |
         Marker::I32 |
         Marker::I64 |
         Marker::F32 |
-        Marker::F64  => {
-            match tri!(read_any_number(rd, marker)) {
-                AnyNumber::U8(n) => visitor.visit_u8(n),
-                AnyNumber::U16(n) => visitor.visit_u16(n),
-                AnyNumber::U32(n) => visitor.visit_u32(n),
-                AnyNumber::U64(n) => visitor.visit_u64(n),
-                AnyNumber::I8(n) => visitor.visit_i8(n),
-                AnyNumber::I16(n) => visitor.visit_i16(n),
-                AnyNumber::I32(n) => visitor.visit_i32(n),
-                AnyNumber::I64(n) => visitor.visit_i64(n),
-                AnyNumber::F32(n) => visitor.visit_f32(n),
-                AnyNumber::F64(n) => visitor.visit_f64(n),
+        Marker::F64 => Header::Num(tri!(read_any_number(rd, marker))),
+        Marker::FixStr(_) | Marker::Str8 | Marker::Str16 | Marker::Str32 => Header::Str(tri!(read_str_data(rd, marker))),
+        Marker::FixArray(_) | Marker::Array16 | Marker::Array32 => Header::Array(tri!(read_array_len(rd, marker))),
+        Marker::FixMap(_) | Marker::Map16 | Marker::Map32 => Header::Map(tri!(read_map_len(rd, marker))),
+        Marker::Bin8 | Marker::Bin16 | Marker::Bin32 => Header::Bin(tri!(read_bin_data(rd, marker))),
+        Marker::FixExt1 |
+        Marker::FixExt2 |
+        Marker::FixExt4 |
+        Marker::FixExt8 |
+        Marker::FixExt16 |
+        Marker::Ext8 |
+        Marker::Ext16 |
+        Marker::Ext32 => Header::Ext(tri!(ext_len(rd, marker))),
+        Marker::Reserved => return Err(Error::TypeMismatch(Marker::Reserved)),
+    })
+}
+
+fn visit_num<'de, V: Visitor<'de>>(visitor: V, n: AnyNumber) -> Result<V::Value, Error> {
+    match n {
+        AnyNumber::U8(n) => visitor.visit_u8(n),
+        AnyNumber::U16(n) => visitor.visit_u16(n),
+        AnyNumber::U32(n) => visitor.visit_u32(n),
+        AnyNumber::U64(n) => visitor.visit_u64(n),
+        AnyNumber::I8(n) => visitor.visit_i8(n),
+        AnyNumber::I16(n) => visitor.visit_i16(n),
+        AnyNumber::I32(n) => visitor.visit_i32(n),
+        AnyNumber::I64(n) => visitor.visit_i64(n),
+        AnyNumber::F32(n) => visitor.visit_f32(n),
+        AnyNumber::F64(n) => visitor.visit_f64(n),
+    }
+}
+
+/// Bytes of a `bin` that is read as a sequence, reversed so `SeqAccess` can pop them.
+#[inline(never)]
+fn bin_to_seq(buf: Reference<'_, '_, [u8]>) -> Vec<u8> {
+    let (Reference::Borrowed(buf) | Reference::Copied(buf)) = buf;
+    buf.iter().rev().copied().collect()
+}
+
+impl<'de, R: ReadSlice<'de>, C> Deserializer<R, C> {
+    #[inline]
+    fn next_header(&mut self) -> Result<Header<'de, '_>, Error> {
+        let marker = tri!(self.take_or_read_marker());
+        read_header(&mut self.rd, marker)
+    }
+
+    /// Skips over one value without instantiating anything per visitor.
+    #[inline(never)]
+    fn skip_value(&mut self) -> Result<(), Error> {
+        let mut pending = 1u64;
+        while pending > 0 {
+            pending -= 1;
+            match tri!(self.next_header()) {
+                Header::Array(len) => pending += u64::from(len),
+                Header::Map(len) => pending += 2 * u64::from(len),
+                Header::Ext(len) => {
+                    tri!(self.rd.read_data_i8());
+                    tri!(read_bin_content(&mut self.rd, len));
+                },
+                _ => {},
             }
         }
-        other_marker => Err(Error::TypeMismatch(other_marker)),
+        Ok(())
     }
 }
 
 impl<'de, R: ReadSlice<'de>, C: SerializerConfig> Deserializer<R, C> {
-    fn any_inner<V: Visitor<'de>>(&mut self, visitor: V, allow_bytes: bool) -> Result<V::Value, Error> {
+    fn visit_array<V: Visitor<'de>>(&mut self, visitor: V, len: u32, bin: Vec<u8>) -> Result<V::Value, Error> {
+        depth_count!(self.depth, {
+            let mut seq = SeqAccess { de: self, left: len, bin };
+            let res = tri!(visitor.visit_seq(&mut seq));
+            match seq.left {
+                0 => Ok(res),
+                // Leftover `bin` bytes have been read already
+                _ if !seq.bin.is_empty() => Ok(res),
+                excess => Err(Error::LengthMismatch(len - excess)),
+            }
+        })
+    }
+
+    fn visit_map<V: Visitor<'de>>(&mut self, visitor: V, len: u32) -> Result<V::Value, Error> {
+        depth_count!(self.depth, {
+            let mut map = MapAccess::new(self, len);
+            let res = tri!(visitor.visit_map(&mut map));
+            match map.left {
+                0 => Ok(res),
+                excess => Err(Error::LengthMismatch(len - excess)),
+            }
+        })
+    }
+
+    fn any_inner<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value, Error> {
+        match tri!(self.next_header()) {
+            Header::Nil => visitor.visit_unit(),
+            Header::Bool(b) => visitor.visit_bool(b),
+            Header::Num(n) => visit_num(visitor, n),
+            Header::Str(data) => visit_str_data(visitor, data),
+            Header::Array(len) => self.visit_array(visitor, len, Vec::new()),
+            Header::Map(len) => self.visit_map(visitor, len),
+            Header::Bin(Reference::Borrowed(buf)) => visitor.visit_borrowed_bytes(buf),
+            Header::Bin(Reference::Copied(buf)) => visitor.visit_bytes(buf),
+            Header::Ext(len) => depth_count!(self.depth, visitor.visit_newtype_struct(ExtDeserializer::new(self, len))),
+        }
+    }
+
+    // The `*_inner` functions below only call the `visit_*` methods relevant for their hint and
+    // report everything else with a non-generic error, which keeps per-visitor code small.
+
+    /// Structs, tuples, sequences and maps. A `bin` is read as a sequence of `u8`.
+    fn seq_inner<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value, Error> {
+        match tri!(self.next_header()) {
+            Header::Array(len) => self.visit_array(visitor, len, Vec::new()),
+            Header::Map(len) => self.visit_map(visitor, len),
+            Header::Bin(buf) => {
+                let bin = bin_to_seq(buf);
+                self.visit_array(visitor, bin.len() as u32, bin)
+            },
+            other => Err(other.invalid_type(&visitor)),
+        }
+    }
+
+    /// Strings and chars. Bytes are passed on, since e.g. `String` accepts valid UTF-8 bytes.
+    fn str_inner<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value, Error> {
+        match tri!(self.next_header()) {
+            Header::Str(data) => visit_str_data(visitor, data),
+            Header::Bin(Reference::Borrowed(buf)) => visitor.visit_borrowed_bytes(buf),
+            Header::Bin(Reference::Copied(buf)) => visitor.visit_bytes(buf),
+            other => Err(other.invalid_type(&visitor)),
+        }
+    }
+
+    /// Field and variant names or indices. Never calls `visit_bytes`, which derived field
+    /// visitors implement with a match as large as `visit_str`, so names must be valid UTF-8.
+    fn identifier_inner<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value, Error> {
+        match tri!(self.next_header()) {
+            Header::Str(StrData::BorrowedStr(s)) => visitor.visit_borrowed_str(s),
+            Header::Str(StrData::Str(s)) => visitor.visit_str(s),
+            Header::Bin(Reference::Borrowed(buf)) => visitor.visit_borrowed_str(tri!(str::from_utf8(buf))),
+            Header::Bin(Reference::Copied(buf)) => visitor.visit_str(tri!(str::from_utf8(buf))),
+            Header::Num(AnyNumber::U8(n)) => visitor.visit_u64(n.into()),
+            Header::Num(AnyNumber::U16(n)) => visitor.visit_u64(n.into()),
+            Header::Num(AnyNumber::U32(n)) => visitor.visit_u64(n.into()),
+            Header::Num(AnyNumber::U64(n)) => visitor.visit_u64(n),
+            other => Err(other.invalid_type(&visitor)),
+        }
+    }
+
+    fn bytes_inner<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value, Error> {
+        match tri!(self.next_header()) {
+            Header::Bin(Reference::Borrowed(buf)) => visitor.visit_borrowed_bytes(buf),
+            Header::Bin(Reference::Copied(buf)) => visitor.visit_bytes(buf),
+            Header::Str(data) => visit_str_data(visitor, data),
+            Header::Array(len) => self.visit_array(visitor, len, Vec::new()),
+            other => Err(other.invalid_type(&visitor)),
+        }
+    }
+
+    fn num_inner<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value, Error> {
         let marker = tri!(self.take_or_read_marker());
         match marker {
-            Marker::Null |
-            Marker::True |
-            Marker::False |
-            Marker::FixPos(_) |
-            Marker::FixNeg(_) |
-            Marker::U8 |
-            Marker::U16 |
-            Marker::U32 |
-            Marker::U64 |
-            Marker::I8 |
-            Marker::I16 |
-            Marker::I32 |
-            Marker::I64 |
-            Marker::F32 |
-            Marker::F64 => any_num(&mut self.rd, visitor, marker),
-            Marker::FixStr(_) | Marker::Str8 | Marker::Str16 | Marker::Str32 => {
-                let data = tri!(read_str_data(&mut self.rd, marker));
-                visit_str_data(visitor, data)
-            }
-            Marker::FixArray(_) |
-            Marker::Array16 |
-            Marker::Array32 => {
-                let len = tri!(read_array_len(&mut self.rd, marker));
-                depth_count!(self.depth, {
-                    let mut seq = SeqAccess::new(self, len);
-                    let res = tri!(visitor.visit_seq(&mut seq));
-                    match seq.left {
-                        0 => Ok(res),
-                        excess => Err(Error::LengthMismatch(len - excess)),
-                    }
-                })
-            }
-            Marker::FixMap(_) |
-            Marker::Map16 |
-            Marker::Map32 => {
-                let len = tri!(read_map_len(&mut self.rd, marker));
-                depth_count!(self.depth, {
-                    let mut seq = MapAccess::new(self, len);
-                    let res = tri!(visitor.visit_map(&mut seq));
-                    match seq.left {
-                        0 => Ok(res),
-                        excess => Err(Error::LengthMismatch(len - excess)),
-                    }
-                })
-            },
-            Marker::Bin8 | Marker::Bin16 | Marker::Bin32 => {
-                match tri!(read_bin_data(&mut self.rd, marker)) {
-                    Reference::Borrowed(buf) if allow_bytes => visitor.visit_borrowed_bytes(buf),
-                    Reference::Copied(buf) if allow_bytes => visitor.visit_bytes(buf),
-                    Reference::Borrowed(buf) | Reference::Copied(buf) => {
-                        visitor.visit_seq(SeqDeserializer::new(buf.iter().copied()))
-                    },
-                }
-            },
-            Marker::FixExt1 |
-            Marker::FixExt2 |
-            Marker::FixExt4 |
-            Marker::FixExt8 |
-            Marker::FixExt16 |
-            Marker::Ext8 |
-            Marker::Ext16 |
-            Marker::Ext32 => {
-                let len = tri!(ext_len(&mut self.rd, marker));
-                depth_count!(self.depth, visitor.visit_newtype_struct(ExtDeserializer::new(self, len)))
-            },
-            Marker::Reserved => Err(Error::TypeMismatch(Marker::Reserved)),
+            Marker::Null => visitor.visit_unit(),
+            Marker::True => visitor.visit_bool(true),
+            Marker::False => visitor.visit_bool(false),
+            _ => visit_num(visitor, tri!(read_any_number(&mut self.rd, marker))),
+        }
+    }
+
+    fn unit_inner<V: Visitor<'de>>(&mut self, visitor: V, allow_empty_array: bool) -> Result<V::Value, Error> {
+        match tri!(self.next_header()) {
+            Header::Nil => visitor.visit_unit(),
+            Header::Array(0) if allow_empty_array => visitor.visit_unit(),
+            other => Err(other.invalid_type(&visitor)),
         }
     }
 }
@@ -737,7 +865,7 @@ impl<'de, R: ReadSlice<'de>, C: SerializerConfig> serde::Deserializer<'de> for &
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
         where V: Visitor<'de>
     {
-        self.any_inner(visitor, true)
+        self.any_inner(visitor)
     }
 
     fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -804,16 +932,8 @@ impl<'de, R: ReadSlice<'de>, C: SerializerConfig> serde::Deserializer<'de> for &
     fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value, Self::Error>
         where V: Visitor<'de>
     {
-        // We need to special case this so that [] is treated as a unit struct when asked for,
-        // but as a sequence otherwise. This is because we serialize unit structs as [] rather
-        // than as 'nil'.
-        match self.take_or_read_marker()? {
-            Marker::Null | Marker::FixArray(0) => visitor.visit_unit(),
-            marker => {
-                self.marker = Some(marker);
-                self.deserialize_any(visitor)
-            },
-        }
+        // Unit structs are serialized as [], but nil is accepted as well
+        self.unit_inner(visitor, true)
     }
 
     #[inline]
@@ -834,96 +954,120 @@ impl<'de, R: ReadSlice<'de>, C: SerializerConfig> serde::Deserializer<'de> for &
 
     #[inline]
     fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        self.any_inner(visitor, false)
+        self.seq_inner(visitor)
     }
 
     #[inline]
     fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        self.any_inner(visitor, false)
+        self.seq_inner(visitor)
     }
 
     #[inline]
     fn deserialize_struct<V>(self, _: &'static str, _: &'static [&'static str], visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        self.any_inner(visitor, false)
+        self.seq_inner(visitor)
     }
 
     #[inline]
     fn deserialize_tuple_struct<V>(self, _: &'static str, _: usize, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        self.any_inner(visitor, false)
+        self.seq_inner(visitor)
     }
 
-    forward_to_deserialize_any! {
-        bytes byte_buf unit
-        map identifier str string char
-        ignored_any
+    #[inline]
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.str_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.str_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.str_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.identifier_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.bytes_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.bytes_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.unit_inner(visitor, false)
+    }
+
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        tri!(self.skip_value());
+        visitor.visit_unit()
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 
     fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 
     fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 
     fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 
     fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 
     fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 
     fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 
     fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
-        let marker = self.take_or_read_marker()?;
-        any_num(&mut self.rd, visitor, marker)
+        self.num_inner(visitor)
     }
 }
 
 struct SeqAccess<'a, R, C> {
     de: &'a mut Deserializer<R, C>,
     left: u32,
-}
-
-impl<'a, R: 'a, C> SeqAccess<'a, R, C> {
-    #[inline]
-    const fn new(de: &'a mut Deserializer<R, C>, len: u32) -> Self {
-        SeqAccess { de, left: len }
-    }
+    /// Remaining bytes (reversed) of a `bin` read as a sequence. Each is handed to the element
+    /// as a `FixPos` marker, so elements use the same `Deserializer` type as for arrays.
+    bin: Vec<u8>,
 }
 
 impl<'de, 'a, R: ReadSlice<'de> + 'a, C: SerializerConfig> de::SeqAccess<'de> for SeqAccess<'a, R, C> {
@@ -935,6 +1079,9 @@ impl<'de, 'a, R: ReadSlice<'de> + 'a, C: SerializerConfig> de::SeqAccess<'de> fo
     {
         if self.left > 0 {
             self.left -= 1;
+            if let Some(b) = self.bin.pop() {
+                self.de.marker = Some(Marker::FixPos(b));
+            }
             Ok(Some(tri!(seed.deserialize(&mut *self.de))))
         } else {
             Ok(None)

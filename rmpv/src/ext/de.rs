@@ -305,6 +305,34 @@ impl<'de> Deserialize<'de> for ValueRef<'de> {
     }
 }
 
+impl Value {
+    fn seq_inner<'de, V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        match self {
+            Self::Array(v) => {
+                let len = v.len();
+                let mut de = SeqDeserializer::new(v.into_iter());
+                let seq = visitor.visit_seq(&mut de)?;
+                if de.iter.len() == 0 {
+                    Ok(seq)
+                } else {
+                    Err(de::Error::invalid_length(len, &"fewer elements in array"))
+                }
+            },
+            Self::Map(v) => {
+                let len = v.len();
+                let mut de = MapDeserializer::new(v.into_iter());
+                let map = visitor.visit_map(&mut de)?;
+                if de.iter.len() == 0 {
+                    Ok(map)
+                } else {
+                    Err(de::Error::invalid_length(len, &"fewer elements in map"))
+                }
+            },
+            other => Err(de::Error::invalid_type(other.unexpected(), &visitor)),
+        }
+    }
+}
+
 impl<'de> Deserializer<'de> for Value {
     type Error = Error;
 
@@ -390,10 +418,102 @@ impl<'de> Deserializer<'de> for Value {
         ValueBase::deserialize_unit_struct(self, visitor)
     }
 
+    // Narrow hints only call the relevant `visit_*` methods, which keeps per-visitor code small.
+
+    #[inline]
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_tuple_struct<V>(self, _name: &'static str, _len: usize, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_struct<V>(self, _name: &'static str, _fields: &'static [&'static str], visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        match self {
+            Value::String(Utf8String { s: Ok(v) }) => visitor.visit_string(v),
+            Value::Integer(Integer { n: IntPriv::PosInt(v) }) => visitor.visit_u64(v),
+            Value::Binary(v) => match String::from_utf8(v) {
+                Ok(v) => visitor.visit_string(v),
+                Err(err) => Err(de::Error::invalid_type(Unexpected::Bytes(err.as_bytes()), &visitor)),
+            },
+            other => Err(de::Error::invalid_type(other.unexpected(), &visitor)),
+        }
+    }
+
     forward_to_deserialize_any! {
-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string unit seq
-        bytes byte_buf map tuple_struct struct
-        identifier tuple ignored_any
+        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string unit
+        bytes byte_buf ignored_any
+    }
+}
+
+impl<'de> ValueRef<'de> {
+    fn seq_inner<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        match self {
+            ValueRef::Array(v) => {
+                let len = v.len();
+                let mut de = SeqDeserializer::new(v.into_iter());
+                let seq = visitor.visit_seq(&mut de)?;
+                if de.iter.len() == 0 {
+                    Ok(seq)
+                } else {
+                    Err(de::Error::invalid_length(len, &"fewer elements in array"))
+                }
+            },
+            ValueRef::Map(v) => {
+                let len = v.len();
+                let mut de = MapDeserializer::new(v.into_iter());
+                let map = visitor.visit_map(&mut de)?;
+                if de.iter.len() == 0 {
+                    Ok(map)
+                } else {
+                    Err(de::Error::invalid_length(len, &"fewer elements in map"))
+                }
+            },
+            other => Err(de::Error::invalid_type(other.unexpected(), &visitor)),
+        }
+    }
+
+    fn seq_inner_ref<V: Visitor<'de>>(&'de self, visitor: V) -> Result<V::Value, Error> {
+        match *self {
+            ValueRef::Array(ref v) => {
+                let len = v.len();
+                let mut de = SeqDeserializer::new(v.iter());
+                let seq = visitor.visit_seq(&mut de)?;
+                if de.iter.len() == 0 {
+                    Ok(seq)
+                } else {
+                    Err(de::Error::invalid_length(len, &"fewer elements in array"))
+                }
+            },
+            ValueRef::Map(ref v) => {
+                let len = v.len();
+                let mut de = MapRefDeserializer::new(v.iter());
+                let map = visitor.visit_map(&mut de)?;
+                if de.iter.len() == 0 {
+                    Ok(map)
+                } else {
+                    Err(de::Error::invalid_length(len, &"fewer elements in map"))
+                }
+            },
+            ref other => Err(de::Error::invalid_type(other.unexpected(), &visitor)),
+        }
     }
 }
 
@@ -483,10 +603,48 @@ impl<'de> Deserializer<'de> for ValueRef<'de> {
         ValueBase::deserialize_unit_struct(self, visitor)
     }
 
+    // Narrow hints only call the relevant `visit_*` methods, which keeps per-visitor code small.
+
+    #[inline]
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_tuple_struct<V>(self, _name: &'static str, _len: usize, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_struct<V>(self, _name: &'static str, _fields: &'static [&'static str], visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    #[inline]
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner(visitor)
+    }
+
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        match self {
+            ValueRef::String(Utf8StringRef { s: Ok(v) }) => visitor.visit_borrowed_str(v),
+            ValueRef::Integer(Integer { n: IntPriv::PosInt(v) }) => visitor.visit_u64(v),
+            ValueRef::Binary(v) => match std::str::from_utf8(v) {
+                Ok(v) => visitor.visit_borrowed_str(v),
+                Err(_) => Err(de::Error::invalid_type(Unexpected::Bytes(v), &visitor)),
+            },
+            other => Err(de::Error::invalid_type(other.unexpected(), &visitor)),
+        }
+    }
+
     forward_to_deserialize_any! {
-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string unit seq
-        bytes byte_buf map tuple_struct struct
-        identifier tuple ignored_any
+        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string unit
+        bytes byte_buf ignored_any
     }
 }
 
@@ -607,10 +765,48 @@ impl<'de> Deserializer<'de> for &'de ValueRef<'de> {
         }
     }
 
+    // Narrow hints only call the relevant `visit_*` methods, which keeps per-visitor code small.
+
+    #[inline]
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner_ref(visitor)
+    }
+
+    #[inline]
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner_ref(visitor)
+    }
+
+    #[inline]
+    fn deserialize_tuple_struct<V>(self, _name: &'static str, _len: usize, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner_ref(visitor)
+    }
+
+    #[inline]
+    fn deserialize_struct<V>(self, _name: &'static str, _fields: &'static [&'static str], visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner_ref(visitor)
+    }
+
+    #[inline]
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        self.seq_inner_ref(visitor)
+    }
+
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error> where V: Visitor<'de> {
+        match self {
+            ValueRef::String(Utf8StringRef { s: Ok(v) }) => visitor.visit_borrowed_str(v),
+            ValueRef::Integer(Integer { n: IntPriv::PosInt(v) }) => visitor.visit_u64(*v),
+            ValueRef::Binary(v) => match std::str::from_utf8(v) {
+                Ok(v) => visitor.visit_borrowed_str(v),
+                Err(_) => Err(de::Error::invalid_type(Unexpected::Bytes(v), &visitor)),
+            },
+            other => Err(de::Error::invalid_type(other.unexpected(), &visitor)),
+        }
+    }
+
     forward_to_deserialize_any! {
-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string unit seq
-        bytes byte_buf map tuple_struct struct
-        identifier tuple ignored_any
+        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string unit
+        bytes byte_buf ignored_any
     }
 }
 
